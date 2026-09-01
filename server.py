@@ -34,6 +34,7 @@ from typing import Annotated, Any, Literal
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.utilities.types import NOT_GIVEN  # noqa: F401 (typing marker)
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -142,6 +143,19 @@ CHEAPIES_FEED_URL = os.getenv("CHEAPIES_FEED_URL", "https://www.cheapies.nz/deal
 
 # Keepa — official paid API for Amazon price history (covers amazon.com.au)
 KEEPA_API_KEY = os.getenv("KEEPA_API_KEY")
+
+# eBay marketplace account deletion/closure notifications compliance.
+# A NEW production keyset stays DISABLED (token endpoint → 401 invalid_client)
+# until this flow is completed in the developer portal. The "subscribe" path
+# needs a public HTTPS endpoint that answers the GET challenge and ACKs the
+# POST notifications — both implemented below as FastMCP custom routes.
+# Configure in the portal (Application Keys → Production → notifications):
+#   Endpoint URL:        https://procurement.jupiter.au/ebay/notifications
+#   Verification token:  the EBAY_DELETION_TOKEN value from sops/env
+EBAY_DELETION_TOKEN = os.getenv("EBAY_DELETION_TOKEN")
+# The EXACT public URL registered with eBay — the SHA-256 hashes the endpoint
+# string itself, so it must match byte-for-byte what's in the portal.
+EBAY_DELETION_ENDPOINT = os.getenv("EBAY_DELETION_ENDPOINT", "https://procurement.jupiter.au/ebay/notifications")
 
 # Postgres — fleet store on callisto 10.1.1.3, jupiter db per stack law
 DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. postgresql://procurement:***@10.1.1.3:5432/jupiter
@@ -1271,6 +1285,51 @@ def procurement_brief(query: str) -> str:
         "then compare landed cost (price_aud * qty + shipping), ETA and seller rating. "
         "Explain cheapest vs fastest vs best value and flag MOQ issues for 1688 wholesale."
     )
+
+
+# ---------------------------------------------------------------------------
+# eBay marketplace account deletion/closure notifications — compliance routes
+# ---------------------------------------------------------------------------
+# Contract (developer.ebay.com/develop/guides/sell/marketplace-user-account-deletion):
+#   GET  <endpoint>?challenge_code=<code> → 200 OK, application/json,
+#        {"challengeResponse": "<sha256_hex(challengeCode + token + endpoint)>"}
+#        Hash order is EXACT: challengeCode + verificationToken + endpoint.
+#   POST <endpoint> — deletion notification payload → any 2xx ACK
+#        (200/201/202/204). We log it and 204.
+# Plain Starlette routes mounted on the FastMCP streamable-HTTP app — served
+# whenever MCP_HTTP_PORT is set (the callisto systemd unit / tunnel path).
+
+from starlette.requests import Request  # noqa: E402
+from starlette.responses import JSONResponse, Response  # noqa: E402
+
+
+@mcp.custom_route("/ebay/notifications", methods=["GET"])
+async def ebay_deletion_challenge(request: Request) -> JSONResponse:
+    """eBay subscription verification: hash challenge + token + endpoint."""
+    challenge = request.query_params.get("challenge_code")
+    if not EBAY_DELETION_TOKEN:
+        return JSONResponse({"error": "EBAY_DELETION_TOKEN not configured"}, status_code=500)
+    if not challenge:
+        return JSONResponse({"error": "challenge_code query param required"}, status_code=400)
+    # EXACT hash order per eBay's contract: challengeCode + verificationToken + endpoint
+    digest = hashlib.sha256(
+        (challenge + EBAY_DELETION_TOKEN + EBAY_DELETION_ENDPOINT).encode("utf-8")
+    ).hexdigest()
+    return JSONResponse({"challengeResponse": digest})
+
+
+@mcp.custom_route("/ebay/notifications", methods=["POST"])
+async def ebay_deletion_notify(request: Request) -> Response:
+    """eBay deletion/closure notification: acknowledge with 2xx."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    # Log-only audit trail — this app holds no marketplace user data to
+    # delete (search-only, no user tokens persisted), so ACK is the whole
+    # obligation. Keep the payload in the journal for the audit trail.
+    print(f"[ebay-deletion] notification received: {json.dumps(body)[:500] if body else '(empty)'}", flush=True)
+    return Response(status_code=204)
 
 
 def main() -> None:
