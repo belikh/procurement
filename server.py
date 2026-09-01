@@ -75,7 +75,7 @@ class CommunitySignal(BaseModel):
 
 class Offer(BaseModel):
     offer_id: str = Field(description="Stable id marketplace:product:sku, e.g. 1688:123456:sku147")
-    marketplace: str = Field(description="aliexpress | taobao | tmall | 1688 | jd | pdd | ebay_au | amazon_au | gumtree | facebook | ozbargain | cheapies | ozbargain_search")
+    marketplace: str = Field(description="aliexpress | taobao | tmall | 1688 | jd | pdd | ebay_au | amazon_au | gumtree | facebook | ozbargain | cheapies")
     title: str
     title_en: str | None = None
     url: str | None = None
@@ -121,7 +121,6 @@ AMAZON_PAAPI_PARTNER_TAG = os.getenv("AMAZON_PAAPI_PARTNER_TAG")  # e.g. jupiter
 SOCIAVAULT_API_KEY = os.getenv("SOCIAVAULT_API_KEY")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")  # for Gumtree / JD / OzBargain / Amazon / eBay-sold actors
 GUMTREE_APIFY_ACTOR = os.getenv("GUMTREE_APIFY_ACTOR", "crawlerbros/gumtree-scraper")
-OZBARGAIN_APIFY_ACTOR = os.getenv("OZBARGAIN_APIFY_ACTOR", "parseforge/ozbargain-australia-scraper")
 # eBay sold-price comps (supports ebay.com.au) and Amazon AU fallback (no
 # PA-API/SP-API credentials needed — hosted actors).
 EBAY_SOLD_APIFY_ACTOR = os.getenv("EBAY_SOLD_APIFY_ACTOR", "caffein.dev/ebay-sold-listings")
@@ -316,46 +315,6 @@ mcp = FastMCP(
 # Helpers
 # ---------------------------------------------------------------------------
 
-MOCK_OFFERS: list[Offer] = [
-    Offer(
-        offer_id="mock:ebay_au:1",
-        marketplace="ebay_au",
-        title="Silicone Kitchen Utensil Set 12pcs — heat resistant",
-        url="https://www.ebay.com.au/itm/mock1",
-        price_aud=24.95,
-        price_cny=None,
-        stock=120,
-        shipping=Shipping(intl_estimate_aud=0, eta_days=[3, 6], method="AU domestic"),
-        seller=Seller(shop_name="Sydney Kitchen Co", rating=4.9, verified=True),
-        source_reliability="authoritative",
-    ),
-    Offer(
-        offer_id="mock:1688:123456:sku1",
-        marketplace="1688",
-        title="硅胶厨具套装 12件套 食品级",
-        title_en="Silicone utensil set 12pcs food grade",
-        url="https://detail.1688.com/offer/123456.html",
-        price_cny=18.5,
-        price_aud=round(18.5 * CNY_TO_AUD, 2),
-        moq=10,
-        unit="set",
-        stock=5000,
-        shipping=Shipping(domestic_cny=0, intl_estimate_aud=18.5, eta_days=[12, 22], method="Cainiao consolidated"),
-        seller=Seller(shop_name="义乌工厂直销", rating=4.8, verified=True),
-        source_reliability="aggregator",
-    ),
-    Offer(
-        offer_id="mock:facebook:fb1",
-        marketplace="facebook",
-        title="Silicone utensils — barely used",
-        url="https://www.facebook.com/marketplace/item/mockfb1",
-        price_aud=15.0,
-        shipping=Shipping(intl_estimate_aud=0, eta_days=[1, 3], method="Local pickup — Sydney"),
-        seller=Seller(shop_name="Private seller", rating=4.6),
-        source_reliability="best_effort",
-    ),
-]
-
 
 def _has_any_key(keys: list[str | None]) -> bool:
     return any(k for k in keys if k)
@@ -442,20 +401,34 @@ async def _search_tmapi(query: str, marketplace: str, max_results: int) -> list[
         ]
 
 
+_EBAY_TOKEN_CACHE: tuple[str, float] | None = None  # (token, expiry_epoch)
+
+
 async def _get_ebay_token() -> str | None:
+    global _EBAY_TOKEN_CACHE
     if EBAY_OAUTH_TOKEN:
         return EBAY_OAUTH_TOKEN
     if not _has_any_key([EBAY_APP_ID, EBAY_CERT_ID]):
         return None
+    # cached token still valid?
+    if _EBAY_TOKEN_CACHE and _EBAY_TOKEN_CACHE[1] > time.time():
+        return _EBAY_TOKEN_CACHE[0]
+    # NOTE: the endpoint is /identity/v1/oauth2/token (the legacy
+    # /oauth/token path 404s). Token cached until expiry minus 60s margin
+    # so each search doesn't re-fetch.
     creds = base64.b64encode(f"{EBAY_APP_ID}:{EBAY_CERT_ID}".encode()).decode()
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
         r = await client.post(
-            "https://api.ebay.com/identity/v1/oauth/token",
+            "https://api.ebay.com/identity/v1/oauth2/token",
             headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
             data={"grant_type": "client_credentials", "scope": "https://api.ebay.com/oauth/api_scope"},
         )
         r.raise_for_status()
-        return r.json().get("access_token")
+        tok = r.json().get("access_token")
+        exp = r.json().get("expires_in") or 0
+        if tok and exp:
+            _EBAY_TOKEN_CACHE = (tok, time.time() + int(exp) - 60)
+        return tok
 
 
 async def _search_ebay_au(query: str, max_results: int, sort: str) -> list[Offer]:
@@ -751,70 +724,6 @@ async def _search_deal_feed(feed_url: str, marketplace: str, query: str | None, 
             return _parse_deal_feed(r.text, marketplace, query, max_results)
     except Exception as e:
         return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] feed error: {e}", source_reliability="authoritative", raw={"error": str(e)})]
-
-
-# ---------------------------------------------------------------------------
-# OzBargain keyword search via hosted Apify actor (reuses APIFY_TOKEN)
-# ---------------------------------------------------------------------------
-
-
-async def _search_apify_ozbargain(query: str, max_results: int = 10) -> list[Offer]:
-    """Keyword search over OzBargain via the hosted actor — keyword-matched
-    deals with price/votes/merchant. You call the API; Apify runs the browser.
-
-    Actor input (per its published OpenAPI schema): feed=deals|popular|freebies,
-    searchTerm (title filter), maxItems. Addressed with the `~` separator.
-    """
-    if not APIFY_TOKEN:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"https://api.apify.com/v2/acts/{OZBARGAIN_APIFY_ACTOR.replace('/', '~', 1)}/run-sync-get-dataset-items",
-                params={"token": APIFY_TOKEN, "timeout": 25},
-                json={"feed": "deals", "searchTerm": query, "maxItems": max_results},
-            )
-            # run-sync-get-dataset-items answers 201 Created with the dataset
-            # items as the body (verified live); treat 200 and 201 the same.
-            if r.status_code not in (200, 201):
-                return [Offer(offer_id="ozbargain_search:error", marketplace="ozbargain_search", title=f"[ozbargain_search] actor error {r.status_code}", source_reliability="best_effort", raw={"error": r.text[:300]})]
-            items = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
-            offers: list[Offer] = []
-            for it in items[:max_results]:
-                # item shape (from the actor's live output): title, dealUrl,
-                # imageUrl, gotoUrl, link, nodeId, summary, categories[],
-                # author, votesPositive, votesNegative, commentCount,
-                # clickCount, expired, publishedAt — price is title-embedded
-                price_aud = _title_price_aud(it.get("title") or "")
-                votes_pos = it.get("votesPositive")
-                votes_neg = it.get("votesNegative")
-                cats = it.get("categories") or []
-                offers.append(
-                    Offer(
-                        offer_id=f"ozbargain_search:{it.get('nodeId') or it.get('link') or 'unknown'}",
-                        marketplace="ozbargain_search",
-                        title=it.get("title") or query,
-                        url=it.get("link") or it.get("gotoUrl"),
-                        image=it.get("imageUrl"),
-                        price_aud=price_aud,
-                        shipping=Shipping(eta_days=[0, 0], method="Deal listing — see merchant"),
-                        seller=Seller(shop_name=(it.get("categories") or [""])[0] if cats else None),
-                        community=CommunitySignal(
-                            votes_pos=int(votes_pos) if isinstance(votes_pos, (int, float)) else None,
-                            votes_neg=int(votes_neg) if isinstance(votes_neg, (int, float)) else None,
-                            comment_count=it.get("commentCount") if isinstance(it.get("commentCount"), (int, float)) else None,
-                            click_count=it.get("clickCount") if isinstance(it.get("clickCount"), (int, float)) else None,
-                            expiry=it.get("publishedAt"),
-                            brand=next((c for c in cats if c in (it.get("categories") or [])), None),
-                            tags=cats or None,
-                        ),
-                        source_reliability="best_effort",  # hosted scrape, not the official feed
-                        raw={"dealUrl": it.get("dealUrl"), "goto": it.get("gotoUrl"), "summary": (it.get("summary") or "")[:200], "expired": it.get("expired")} if os.getenv("PROCUREMENT_INCLUDE_RAW") == "1" else None,
-                    )
-                )
-            return offers
-    except Exception as e:
-        return [Offer(offer_id="ozbargain_search:error", marketplace="ozbargain_search", title=f"[ozbargain_search] error: {e}", source_reliability="best_effort", raw={"error": str(e)})]
 
 
 # ---------------------------------------------------------------------------
@@ -1126,7 +1035,7 @@ async def search_offers(
     query: Annotated[str, Field(description="Product keyword. Chinese yields best recall for Chinese sources (e.g. 硅胶厨具). English is auto-translated for TMAPI call.")],
     marketplaces: Annotated[
         list[str] | None,
-        Field(description="Subset to search. Defaults to all. Valid: aliexpress, taobao, tmall, 1688, jd, pdd, ebay_au, ebay_sold (real AU sold prices), amazon_au, gumtree, facebook, woolworths, coles, aldi (grocery with unit pricing), ozbargain, cheapies, ozbargain_search. Unknown values ignored."),
+        Field(description="Subset to search. Defaults to all. Valid: aliexpress, taobao, tmall, 1688, jd, pdd, ebay_au, ebay_sold (real AU sold prices), amazon_au, gumtree, facebook, woolworths, coles, aldi (grocery with unit pricing), ozbargain, cheapies. Unknown values ignored."),
     ] = None,
     sort: Annotated[Literal["cheapest", "fastest", "best_value"], Field(description="Ranking intent")] = "best_value",
     qty: Annotated[int, Field(ge=1, description="Requested quantity — used for MOQ check on 1688 wholesale")] = 1,
@@ -1136,15 +1045,16 @@ async def search_offers(
     """Federated procurement search — `find me the cheapest / fastest / best value <item>` across Chinese + AU sources.
 
     Every marketplace is reached via a hosted API (no scrapers built here).
-    Missing API keys are skipped gracefully — you get mock data if *all* keys are missing.
-    When DATABASE_URL (Postgres on 10.1.1.3) is configured, results are cached for CACHE_TTL_S.
+    Missing API keys are skipped gracefully. A query with no matches returns an empty
+    list — never synthetic data. When DATABASE_URL (Postgres on 10.1.1.3) is configured,
+    results are cached for CACHE_TTL_S.
     """
     t0 = time.time()
     all_mps = [
         "taobao", "tmall", "1688", "jd", "pdd", "aliexpress",
         "ebay_au", "ebay_sold", "amazon_au", "gumtree", "facebook",
         "woolworths", "coles", "aldi",
-        "ozbargain", "cheapies", "ozbargain_search",
+        "ozbargain", "cheapies",
     ]
     wanted = [m.lower().strip() for m in (marketplaces or all_mps)]
     wanted = [m for m in wanted if m in all_mps]
@@ -1178,14 +1088,12 @@ async def search_offers(
         if mp in wanted:
             tasks[mp] = asyncio.create_task(_search_grocery_actor(actor, mp, query, max_results))
     # Deal feeds — official RSS, no key. ozbargain/cheapies filter the feed
-    # client-side on the query; ozbargain_search runs the hosted Apify actor
-    # for true keyword search (costs Apify credits).
+    # client-side on the query. (ozbargain_search actor REMOVED 2026-09-01:
+    # junk echo of the query with worse data than the free RSS lane.)
     if "ozbargain" in wanted:
         tasks["ozbargain"] = asyncio.create_task(_search_deal_feed(OZBARGAIN_FEED_URL, "ozbargain", query, max_results))
     if "cheapies" in wanted:
         tasks["cheapies"] = asyncio.create_task(_search_deal_feed(CHEAPIES_FEED_URL, "cheapies", query, max_results))
-    if "ozbargain_search" in wanted and APIFY_TOKEN:
-        tasks["ozbargain_search"] = asyncio.create_task(_search_apify_ozbargain(query, max_results))
 
     results: list[Offer] = []
     if tasks:
@@ -1201,19 +1109,11 @@ async def search_offers(
             except Exception as e:
                 results.append(Offer(offer_id=f"{mp}:error", marketplace=mp, title=f"[{mp}] error: {e}", source_reliability="aggregator"))
 
-    if not results or all(o.offer_id.endswith(":error") or o.offer_id.endswith(":timeout") for o in results):
-        mock = [o for o in MOCK_OFFERS if query.lower().split()[0] in o.title.lower() or True][:max_results]
-        for o in mock:
-            if o.raw is None:
-                o.raw = {}
-            o.raw["mock"] = True
-            o.raw["elapsed_s"] = round(time.time() - t0, 3)
-            o.raw["ship_to"] = ship_to
-            o.raw["qty"] = qty
-        ranked_mock = _rank_offers(mock, sort, qty)[: max_results * 2]
-        await _db_set_cached(cache_key, query, wanted, sort, qty, ship_to, ranked_mock)
-        await _db_log_search(query, wanted, sort, qty, ship_to, len(ranked_mock), int((time.time() - t0) * 1000))
-        return ranked_mock
+    # Honest results: never fabricate. A no-match query returns []; lanes
+    # that errored surface their error Offers (searchable diagnostics), but
+    # synthetic data is never presented as real (mock fallback REMOVED
+    # 2026-09-01 — it fired on legitimate no-match queries, presenting
+    # synthetic offers as if they were results).
 
     ranked = _rank_offers(results, sort, qty)[: max_results * 2]
     # Keepa price-history enrichment for amazon_au offers (no-op without key)
@@ -1226,11 +1126,6 @@ async def search_offers(
 @mcp.tool()
 async def get_offer_detail(offer_id: Annotated[str, Field(description="Offer id from search_offers, e.g. taobao:123456 or ebay_au:1234")]) -> Offer | dict[str, Any]:
     """Fetch full detail for a single offer by id."""
-    if offer_id.startswith("mock:"):
-        for o in MOCK_OFFERS:
-            if o.offer_id == offer_id:
-                return o
-        return {"error": "mock offer not found", "offer_id": offer_id}
     if ":" in offer_id:
         mp, item_id = offer_id.split(":", 1)
         if mp in ("taobao", "tmall", "1688", "jd", "pdd") and not item_id.endswith(":error"):
@@ -1350,14 +1245,13 @@ def health() -> dict[str, Any]:
             "apify_gumtree": bool(APIFY_TOKEN),
             "ozbargain_rss": True,  # official feed, no key
             "cheapies_rss": True,  # official feed, no key
-            "ozbargain_search": bool(APIFY_TOKEN),  # hosted Apify actor
             "ebay_sold_comps": bool(APIFY_TOKEN),  # caffein.dev actor (ebay.com.au)
             "amazon_au_actor": bool(APIFY_TOKEN),  # junglee actor — no PA-API needed
             "grocery": {"woolworths": bool(APIFY_TOKEN), "coles": bool(APIFY_TOKEN), "aldi": bool(APIFY_TOKEN)},
             "image_search": bool(APIFY_TOKEN),  # dev00 reverse image search ($0.10/search)
             "keepa_price_history": bool(KEEPA_API_KEY),
         },
-        "mock_fallback": not any([TMAPI_TOKEN, EBAY_APP_ID, EBAY_OAUTH_TOKEN, SOCIAVAULT_API_KEY, APIFY_TOKEN]),
+        "any_key_configured": any([TMAPI_TOKEN, EBAY_APP_ID, EBAY_OAUTH_TOKEN, SOCIAVAULT_API_KEY, APIFY_TOKEN]),
         "cny_to_aud": CNY_TO_AUD,
         "database": {
             "configured": bool(DATABASE_URL),
