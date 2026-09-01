@@ -34,7 +34,6 @@ from typing import Annotated, Any, Literal
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.utilities.types import NOT_GIVEN  # noqa: F401 (typing marker)
 from pydantic import BaseModel, Field
 
 load_dotenv()
