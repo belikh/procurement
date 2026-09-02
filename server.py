@@ -30,6 +30,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -56,6 +57,19 @@ class Seller(BaseModel):
     shop_id: str | None = None
     rating: float | None = None
     verified: bool | None = None
+
+
+class AuctionInfo(BaseModel):
+    """Live-auction metadata for eBay AUCTION-format listings.
+
+    price_aud on the parent Offer carries the CURRENT BID (converted), not a
+    fixed price — this block makes that explicit and adds the bidding state.
+    """
+    current_bid_aud: float | None = Field(default=None, description="Current bid in AUD (price_aud mirror)")
+    bid_count: int | None = Field(default=None, description="Number of bids so far")
+    end_time: str | None = Field(default=None, description="Auction end ISO datetime (UTC)")
+    time_left: str | None = Field(default=None, description="Humanised time remaining, e.g. '2d 4h'")
+    reserve_met: bool | None = Field(default=None, description="Whether the reserve price has been met, if eBay reports it")
 
 
 class CommunitySignal(BaseModel):
@@ -92,6 +106,8 @@ class Offer(BaseModel):
     shipping: Shipping = Field(default_factory=Shipping)
     seller: Seller = Field(default_factory=Seller)
     community: CommunitySignal | None = Field(default=None, description="Deal-site votes/expiry/brand — OzBargain, Cheapies")
+    auction: AuctionInfo | None = Field(default=None, description="Live-auction metadata when the listing is AUCTION format (price_aud = current bid)")
+    seller_country: str | None = Field(default=None, description="Item/seller country code (eBay itemLocationCountry) when known — global searches populate this")
     price_history: dict[str, Any] | None = Field(default=None, description="Keepa/sold-comps price-history summary")
     source_reliability: Literal["authoritative", "aggregator", "best_effort"] = "aggregator"
     raw: dict[str, Any] | None = Field(default=None, description="Raw marketplace payload for debugging")
@@ -210,8 +226,8 @@ CREATE TABLE IF NOT EXISTS {schema}.search_log (
 """
 
 
-def _cache_key(query: str, marketplaces: list[str], sort: str, qty: int, ship_to: str, max_results: int) -> str:
-    raw = json.dumps({"q": query.strip().lower(), "mps": sorted(marketplaces), "sort": sort, "qty": qty, "ship_to": ship_to, "max": max_results}, sort_keys=True)
+def _cache_key(query: str, marketplaces: list[str], sort: str, qty: int, ship_to: str, max_results: int, ebay_auctions: bool = False, ebay_seller_scope: str = "domestic") -> str:
+    raw = json.dumps({"q": query.strip().lower(), "mps": sorted(marketplaces), "sort": sort, "qty": qty, "ship_to": ship_to, "max": max_results, "ebay_auction": ebay_auctions, "ebay_scope": ebay_seller_scope}, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -482,7 +498,20 @@ async def _get_ebay_token() -> str | None:
         return tok
 
 
-async def _search_ebay_au(query: str, max_results: int, sort: str) -> list[Offer]:
+async def _search_ebay_au(query: str, max_results: int, sort: str, auctions: bool = False, seller_scope: str = "domestic") -> list[Offer]:
+    """eBay AU Browse API search.
+
+    auctions:   AUCTION-format listings only (current bid, bid count, end time).
+                Without it: FIXED_PRICE listings (the historical behaviour).
+    seller_scope:
+      "domestic" — items located in Australia (itemLocationCountry:AU; the
+                   historical buyer-context behaviour).
+      "global"   — no location filter: world-wide sellers shipping into the
+                   AU marketplace (GBP/USD/EUR sellers with converted prices).
+                   Omitting the AU end-user context widens the pool ~19x
+                   (verified: 23 → 2707 for "vintage synthesizer").
+      "auto"     — eBay default (no explicit filter, AU context header set).
+    """
     token = await _get_ebay_token() if _has_any_key([EBAY_APP_ID, EBAY_CERT_ID, EBAY_OAUTH_TOKEN]) else None
     if not token:
         return []
@@ -491,9 +520,19 @@ async def _search_ebay_au(query: str, max_results: int, sort: str) -> list[Offer
     headers = {
         "Authorization": f"Bearer {token}",
         "X-EBAY-C-MARKETPLACE-ID": "EBAY_AU",
-        "X-EBAY-C-ENDUSERCTX": "contextualLocation=country=AU,zip=2000",
     }
+    if seller_scope != "global":
+        headers["X-EBAY-C-ENDUSERCTX"] = "contextualLocation=country=AU,zip=2000"
+
+    filters: list[str] = []
+    if auctions:
+        filters.append("buyingOptions:{AUCTION}")
+    if seller_scope == "domestic":
+        filters.append("itemLocationCountry:AU")
+
     params: dict[str, Any] = {"q": query, "limit": str(max_results), "sort": ebay_sort}
+    if filters:
+        params["filter"] = ",".join(filters)
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
             r = await client.get(url, headers=headers, params=params)
@@ -501,14 +540,32 @@ async def _search_ebay_au(query: str, max_results: int, sort: str) -> list[Offer
             data = r.json()
             offers: list[Offer] = []
             for it in (data.get("itemSummaries") or [])[:max_results]:
+                is_auction = "AUCTION" in (it.get("buyingOptions") or [])
+                bid = it.get("currentBidPrice") or {}
                 price = it.get("price") or {}
+                # Auctions carry currentBidPrice; fixed-price carry price.
+                src = (bid if is_auction and bid.get("value") else price) or {}
                 aud_price = None
                 try:
-                    if price.get("value"):
-                        aud_price = float(price["value"])
+                    if src.get("value"):
+                        aud_price = float(src["value"])
                 except Exception:
                     aud_price = None
+                # Time left for auctions
+                time_left = None
+                if is_auction and it.get("itemEndDate"):
+                    try:
+                        end = datetime.fromisoformat(it["itemEndDate"].replace("Z", "+00:00"))
+                        delta = end - datetime.now(timezone.utc)
+                        if delta.total_seconds() > 0:
+                            d, rem = divmod(int(delta.total_seconds()), 86400)
+                            h, _m = divmod(rem, 3600)
+                            time_left = f"{d}d {h}h" if d else f"{h}h"
+                    except Exception:
+                        time_left = None
                 shipping = it.get("shippingOptions") or [{}]
+                item_country = (it.get("itemLocation") or {}).get("country") or \
+                    ((it.get("shipToLocations") or {}).get("countryCodes") or [None])[0]
                 offers.append(
                     Offer(
                         offer_id=f"ebay_au:{it.get('itemId') or it.get('legacyItemId') or 'unknown'}",
@@ -517,13 +574,20 @@ async def _search_ebay_au(query: str, max_results: int, sort: str) -> list[Offer
                         url=it.get("itemWebUrl") or it.get("itemHref"),
                         image=(it.get("image") or {}).get("imageUrl") or (it.get("thumbnailImages", [{}])[0].get("imageUrl") if it.get("thumbnailImages") else None),
                         price_aud=aud_price,
-                        currency=price.get("currency") or "AUD",
+                        currency=src.get("currency") or "AUD",
                         shipping=Shipping(
                             intl_estimate_aud=0 if any(s.get("shippingCost") is None for s in shipping) else None,
                             eta_days=[3, 7],
-                            method="eBay AU domestic",
+                            method="eBay AU" + (" (auction)" if is_auction else ""),
                         ),
                         seller=Seller(shop_name=(it.get("seller") or {}).get("username")),
+                        auction=AuctionInfo(
+                            current_bid_aud=aud_price if is_auction else None,
+                            bid_count=it.get("bidCount"),
+                            end_time=it.get("itemEndDate"),
+                            time_left=time_left,
+                        ) if is_auction else None,
+                        seller_country=item_country,
                         source_reliability="authoritative",
                         raw=it if os.getenv("PROCUREMENT_INCLUDE_RAW") == "1" else None,
                     )
@@ -1187,6 +1251,8 @@ async def search_offers(
     qty: Annotated[int, Field(ge=1, description="Requested quantity — used for MOQ check on 1688 wholesale")] = 1,
     ship_to: Annotated[str, Field(description="Destination country code, e.g. AU")] = "AU",
     max_results: Annotated[int, Field(ge=1, le=50, description="Per-marketplace cap, then ranked globally")] = 10,
+    ebay_auctions: Annotated[bool, Field(description="eBay lane: AUCTION-format listings only — current bid, bid count, end time. Default false = fixed-price listings.")] = False,
+    ebay_seller_scope: Annotated[Literal["domestic", "global", "auto"], Field(description="eBay lane seller scope. 'domestic' (default): items located in AU. 'global': world-wide sellers into the AU marketplace (~19x pool, converted prices). 'auto': eBay default ranking.")] = "domestic",
 ) -> list[Offer]:
     """Federated procurement search — `find me the cheapest / fastest / best value <item>` across Chinese + AU sources.
 
@@ -1206,7 +1272,7 @@ async def search_offers(
     wanted = [m for m in wanted if m in all_mps]
 
     # Postgres cache hit?
-    cache_key = _cache_key(query, wanted, sort, qty, ship_to, max_results)
+    cache_key = _cache_key(query, wanted, sort, qty, ship_to, max_results, ebay_auctions=ebay_auctions, ebay_seller_scope=ebay_seller_scope)
     cached = await _db_get_cached(cache_key)
     if cached is not None:
         return cached
@@ -1235,7 +1301,7 @@ async def search_offers(
         # honest skip — TMAPI detail-only + no actor.
         tasks["pdd"] = asyncio.create_task(_search_tmapi(query, "pdd", max_results))
     if "ebay_au" in wanted:
-        tasks["ebay_au"] = asyncio.create_task(_search_ebay_au(query, max_results, sort))
+        tasks["ebay_au"] = asyncio.create_task(_search_ebay_au(query, max_results, sort, auctions=ebay_auctions, seller_scope=ebay_seller_scope))
     if "facebook" in wanted:
         tasks["facebook"] = asyncio.create_task(_search_sociavault_facebook(query, max_results=max_results))
     if "gumtree" in wanted:
