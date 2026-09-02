@@ -132,6 +132,14 @@ IMAGE_SEARCH_APIFY_ACTOR = os.getenv("IMAGE_SEARCH_APIFY_ACTOR", "dev00/alibaba-
 # (US, USD, US shipping); no AU-domain support, so it would pollute the
 # federation with non-comparable US prices. Revisit if an AU Costco actor
 # ever appears.
+# Chinese keyword search — zen-studio hosted actors (TMAPI has no keyword
+# search except 1688; these cover taobao/tmall and jd). Verified live
+# 2026-09-02: taobao ¥2.68 spatula, jd Logitech keyboard rows.
+# NOTE: maxItems must be >= 10 per actor input validation.
+TAOBAO_APIFY_ACTOR = os.getenv("TAOBAO_APIFY_ACTOR", "zen-studio/taobao-search-scraper")
+JD_APIFY_ACTOR = os.getenv("JD_APIFY_ACTOR", "zen-studio/jd-com-search-scraper")
+# 1688 wholesale fallback when TMAPI is unsubscribed (verified actor from research):
+ALI1688_APIFY_ACTOR = os.getenv("ALI1688_APIFY_ACTOR", "zen-studio/1688-wholesale-scraper")
 WOOLWORTHS_APIFY_ACTOR = os.getenv("WOOLWORTHS_APIFY_ACTOR", "dromb/woolworths-au-product-search-catalog-unofficial")
 COLES_APIFY_ACTOR = os.getenv("COLES_APIFY_ACTOR", "dromb/coles-au-product-search-specials-stores-unofficial")
 ALDI_APIFY_ACTOR = os.getenv("ALDI_APIFY_ACTOR", "dromb/aldi-au-product-search-catalog-unofficial")
@@ -817,6 +825,58 @@ async def _enrich_with_keepa(offers: list[Offer]) -> list[Offer]:
 
 
 # ---------------------------------------------------------------------------
+# Chinese keyword search — zen-studio hosted actors (taobao/tmall, jd, 1688)
+# ---------------------------------------------------------------------------
+
+
+async def _search_apify_chinese(actor: str, marketplace: str, query: str, max_results: int) -> list[Offer]:
+    """Shared zen-studio Chinese search lane.
+
+    Verified output shapes (2026-09-02 live runs):
+      taobao: itemId, url, title/titleOriginal, price (CNY str), priceCurrency
+      jd:     skuId/itemId (jd- prefixed), url, title, price (CNY float)
+    maxItems floor is 10 per actor input validation.
+    """
+    if not APIFY_TOKEN:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(
+                f"https://api.apify.com/v2/acts/{actor.replace('/', '~', 1)}/run-sync-get-dataset-items",
+                params={"token": APIFY_TOKEN, "timeout": 85},
+                json={"keyword": query, "maxItems": max(max_results, 10), "enrichWithDetails": False},
+            )
+            if r.status_code not in (200, 201):
+                return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] actor error {r.status_code}", source_reliability="best_effort", raw={"error": r.text[:300]})]
+            items = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
+            offers: list[Offer] = []
+            for it in items[:max_results]:
+                price_cny = _float_or_none(it.get("price") or it.get("priceFromSearch"))
+                item_id = str(it.get("itemId") or it.get("skuId") or "unknown")
+                offers.append(
+                    Offer(
+                        offer_id=f"{marketplace}:{item_id}",
+                        marketplace=marketplace,
+                        title=str(it.get("title") or it.get("titleOriginal") or query),
+                        title_en=it.get("titleEn"),
+                        url=it.get("url"),
+                        image=it.get("image") or ((it.get("images") or {}).get("main") if isinstance(it.get("images"), dict) else None),
+                        price_cny=price_cny,
+                        price_aud=_cny_to_aud(price_cny),
+                        currency="CNY",
+                        stock=it.get("stock") if isinstance(it.get("stock"), int) else None,
+                        shipping=Shipping(eta_days=[10, 25], method="China consolidated"),
+                        seller=Seller(shop_name=it.get("shopName") or (it.get("shop") or {}).get("name") if isinstance(it.get("shop"), dict) else it.get("shopName")),
+                        source_reliability="best_effort",  # hosted scrape, not official API
+                        raw={"is_tmall": it.get("isTmall"), "sales": it.get("salesSignal") or it.get("sales")} if os.getenv("PROCUREMENT_INCLUDE_RAW") == "1" else None,
+                    )
+                )
+            return offers
+    except Exception as e:
+        return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] error: {e}", source_reliability="best_effort", raw={"error": str(e)})]
+
+
+# ---------------------------------------------------------------------------
 # eBay sold-price comps — caffein.dev/ebay-sold-listings (supports ebay.com.au)
 # ---------------------------------------------------------------------------
 
@@ -1101,9 +1161,28 @@ async def search_offers(
         return cached
 
     tasks: dict[str, Any] = {}
-    for mp in ["taobao", "tmall", "1688", "jd", "pdd"]:
-        if mp in wanted:
-            tasks[mp] = asyncio.create_task(_search_tmapi(query, mp, max_results))
+    # Chinese keyword search — zen-studio hosted actors (TMAPI has search only
+    # for 1688; these carry taobao/tmall + jd). 1688 prefers TMAPI (official
+    # API) when subscribed, else falls back to the wholesale actor.
+    if "taobao" in wanted or "tmall" in wanted:
+        tasks["taobao"] = asyncio.create_task(_search_apify_chinese(TAOBAO_APIFY_ACTOR, "taobao", query, max_results))
+    if "jd" in wanted:
+        tasks["jd"] = asyncio.create_task(_search_apify_chinese(JD_APIFY_ACTOR, "jd", query, max_results))
+    if "1688" in wanted:
+        async def search_1688() -> list[Offer]:
+            offers = await _search_tmapi(query, "1688", max_results)
+            # honest-unsubscribed / empty → hosted actor fallback
+            if not offers or all(o.offer_id.endswith((":error", ":unsubscribed")) for o in offers):
+                fb = await _search_apify_chinese(ALI1688_APIFY_ACTOR, "1688", query, max_results)
+                real = [o for o in fb if not o.offer_id.endswith(":error")]
+                if real:
+                    return real
+            return offers
+        tasks["1688"] = asyncio.create_task(search_1688())
+    if "pdd" in wanted:
+        # No hosted keyword-search actor for PDD on the store (checked 2026-09-02);
+        # honest skip — TMAPI detail-only + no actor.
+        tasks["pdd"] = asyncio.create_task(_search_tmapi(query, "pdd", max_results))
     if "ebay_au" in wanted:
         tasks["ebay_au"] = asyncio.create_task(_search_ebay_au(query, max_results, sort))
     if "facebook" in wanted:
@@ -1132,10 +1211,11 @@ async def search_offers(
 
     results: list[Offer] = []
     if tasks:
-        # amazon_au scrapes full search pages (~40-70s); everything else rides
-        # the normal timeout. Progressive: fast lanes land first.
+        # Heavy hosted-actor lanes scrape full search pages (30-90s); the
+        # fast lanes (RSS, eBay official API) ride the normal timeout.
+        HEAVY_LANES = {"amazon_au", "taobao", "tmall", "jd", "1688"}
         for mp, task in tasks.items():
-            lane_timeout = 75 if mp == "amazon_au" else DEFAULT_TIMEOUT_S + 2
+            lane_timeout = 95 if mp in HEAVY_LANES else DEFAULT_TIMEOUT_S + 2
             try:
                 chunk = await asyncio.wait_for(task, timeout=lane_timeout)
                 results.extend(chunk)
