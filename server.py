@@ -447,6 +447,12 @@ async def _search_tmapi(query: str, marketplace: str, max_results: int) -> list[
         ]
 
 
+# Cached eBay application token: (token, expiry_epoch). Module-level so the
+# global in _get_ebay_token resolves on FIRST call (a refactor dropped this
+# declaration once — NameError killed the whole lane — never remove it).
+_EBAY_TOKEN_CACHE: tuple[str, float] | None = None
+
+
 async def _get_ebay_token() -> str | None:
     global _EBAY_TOKEN_CACHE
     if EBAY_OAUTH_TOKEN:
@@ -534,7 +540,15 @@ async def _search_sociavault_facebook(query: str, lat: float = -33.8688, lng: fl
             r = await client.get(url, headers={"x-api-key": SOCIAVAULT_API_KEY}, params={"query": query, "lat": lat, "lng": lng, "limit": max_results})
             r.raise_for_status()
             data = r.json()
-            listings = data.get("listings") or data.get("data") or []
+            listings = data.get("listings") or (data.get("data") or {}).get("listings") or []
+            # Sociavault returns listings as a LIST or as a DICT keyed by
+            # index strings ("0", "1", …) depending on response path —
+            # normalise before slicing (slicing a dict is a TypeError,
+            # which presented as 'slice(None, 15, None)' errors).
+            if isinstance(listings, dict):
+                listings = [listings[k] for k in sorted(listings, key=lambda x: int(x) if x.isdigit() else 0)]
+            elif not isinstance(listings, list):
+                listings = []
             offers: list[Offer] = []
             for it in listings[:max_results]:
                 price = it.get("price") or {}
@@ -549,7 +563,7 @@ async def _search_sociavault_facebook(query: str, lat: float = -33.8688, lng: fl
                         marketplace="facebook",
                         title=it.get("title") or query,
                         url=it.get("url") or it.get("listing_url"),
-                        image=it.get("primary_photo") or it.get("image"),
+                        image=(lambda ph: ph.get("url") if isinstance(ph, dict) else ph)(it.get("primary_photo")) or it.get("image"),
                         price_aud=aud,
                         shipping=Shipping(eta_days=[1, 4], method=it.get("delivery_types") and ", ".join(it["delivery_types"]) or "Local pickup / shipping"),
                         seller=Seller(shop_name=it.get("seller_name") or str(it.get("seller_id") or "")),
@@ -563,10 +577,32 @@ async def _search_sociavault_facebook(query: str, lat: float = -33.8688, lng: fl
 
 
 async def _search_apify_gumtree(query: str, max_results: int = 10) -> list[Offer]:
+    """Gumtree AU via hosted actor.
+
+    KNOWN DEGRADED 2026-09-02: Gumtree AU sits behind Akamai Bot Manager;
+    the crawlerbros actor requires RESIDENTIAL/UNBLOCKER proxies, which the
+    FREE Apify plan has 0 of (verified live: actor runs SUCCEED but return
+    0 items; memo23 actor FAILED outright). Recovery options: (a) upgrade
+    the Apify plan for residential proxies, (b) export Gumtree cookies from
+    a real browser session into GUMTREE_COOKIES (the actor's documented
+    Akamai bypass without proxies).
+    """
     if not APIFY_TOKEN:
         return []
+    if not os.getenv("GUMTREE_COOKIES"):
+        return [
+            Offer(
+                offer_id="gumtree:degraded",
+                marketplace="gumtree",
+                title="[gumtree] AU is Akamai-protected; needs residential proxies (Apify plan upgrade) or GUMTREE_COOKIES (EditThisCookie export) — see lane docs",
+                source_reliability="best_effort",
+                raw={"degraded": True, "reason": "Akamai Bot Manager; FREE plan has 0 residential/UNBLOCKER proxies; actors verified returning 0 items"},
+            )
+        ]
     actor = os.getenv("GUMTREE_APIFY_ACTOR", "crawlerbros/gumtree-scraper")
-    url = f"https://api.apify.com/v2/acts/{actor}/runs"
+    # NOTE: the v2 acts API resolves names ONLY with the '~' separator
+    # (user~actor); the '/' form 404s — same fix the ozbargain lane needed.
+    url = f"https://api.apify.com/v2/acts/{actor.replace('/', '~', 1)}/runs"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
@@ -839,19 +875,32 @@ async def _search_apify_chinese(actor: str, marketplace: str, query: str, max_re
     """
     if not APIFY_TOKEN:
         return []
+    # Per-actor input schema (each zen-studio actor differs — the 1688
+    # wholesale scraper takes keywords[] + maxResults, while taobao/jd take
+    # keyword + maxItems floor 10; sending the wrong shape silently returns
+    # nothing or TIMED-OUT):
+    is_1688 = "1688" in actor
+    if is_1688:
+        run_input = {"keywords": [query], "maxResults": max_results, "includeSkuDetails": False, "includeDescriptionHtml": False, "includeSupplierIntelligence": False}
+    else:
+        run_input = {"keyword": query, "maxItems": max(max_results, 10), "enrichWithDetails": False}
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             r = await client.post(
                 f"https://api.apify.com/v2/acts/{actor.replace('/', '~', 1)}/run-sync-get-dataset-items",
                 params={"token": APIFY_TOKEN, "timeout": 85},
-                json={"keyword": query, "maxItems": max(max_results, 10), "enrichWithDetails": False},
+                json=run_input,
             )
             if r.status_code not in (200, 201):
                 return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] actor error {r.status_code}", source_reliability="best_effort", raw={"error": r.text[:300]})]
             items = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
             offers: list[Offer] = []
             for it in items[:max_results]:
-                price_cny = _float_or_none(it.get("price") or it.get("priceFromSearch"))
+                raw_price = it.get("price")
+                if isinstance(raw_price, dict):
+                    # 1688 wholesale shape: {min, max, currency}
+                    raw_price = raw_price.get("min") or raw_price.get("max")
+                price_cny = _float_or_none(raw_price or it.get("priceFromSearch"))
                 item_id = str(it.get("itemId") or it.get("skuId") or "unknown")
                 offers.append(
                     Offer(
@@ -859,8 +908,8 @@ async def _search_apify_chinese(actor: str, marketplace: str, query: str, max_re
                         marketplace=marketplace,
                         title=str(it.get("title") or it.get("titleOriginal") or query),
                         title_en=it.get("titleEn"),
-                        url=it.get("url"),
-                        image=it.get("image") or ((it.get("images") or {}).get("main") if isinstance(it.get("images"), dict) else None),
+                        url=it.get("url") or it.get("productUrl") or it.get("detailUrl"),
+                        image=it.get("image") or it.get("imageUrl") or ((it.get("images") or {}).get("main") if isinstance(it.get("images"), dict) else None),
                         price_cny=price_cny,
                         price_aud=_cny_to_aud(price_cny),
                         currency="CNY",
