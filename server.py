@@ -23,6 +23,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -271,7 +272,7 @@ async def _db_set_cached(cache_key: str, query: str, marketplaces: list[str], so
             await conn.execute(
                 f"""
                 INSERT INTO {PG_SCHEMA}.search_cache (cache_key, query, marketplaces, sort, qty, ship_to, offers, expires_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb, now() + $8::interval)
+                VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb, now() + make_interval(secs => $8))
                 ON CONFLICT (cache_key) DO UPDATE SET offers=EXCLUDED.offers, expires_at=EXCLUDED.expires_at, created_at=now()
                 """,
                 cache_key,
@@ -281,10 +282,11 @@ async def _db_set_cached(cache_key: str, query: str, marketplaces: list[str], so
                 qty,
                 ship_to,
                 payload,
-                f"{CACHE_TTL_S} seconds",
+                CACHE_TTL_S,
             )
     except Exception:
-        pass
+        # Never block a search on cache failure — but leave a breadcrumb.
+        logging.getLogger("procurement").warning("search_cache put failed", exc_info=True)
 
 
 async def _db_log_search(query: str, marketplaces: list[str], sort: str, qty: int, ship_to: str, result_count: int, elapsed_ms: int) -> None:
