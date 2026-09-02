@@ -339,19 +339,29 @@ def _cny_to_aud(cny: float | None) -> float | None:
     return round(cny * CNY_TO_AUD, 2)
 
 
+# TMAPI real endpoint map (verified against tmapi.top doc tree 2026-09-02):
+#   alibaba/1688: /alibaba/search/items (keyword search!) + /alibaba/item_detail_by_url
+#   taobao/tmall: /taobao/item_detail (by id) — NO keyword search on TMAPI
+#   pdd:         /pdd/item_detail (by id) — NO keyword search
+#   jd:          /jd/item_detail (by id) — NO keyword search
+# Chinese keyword search therefore runs ONLY for 1688; the other lanes are
+# detail-only (used by get_offer_detail when we hold an item id/url).
+_TMAPI_DETAIL_PATH = {
+    "taobao": "taobao/item_detail",
+    "tmall": "taobao/item_detail",
+    "1688": "alibaba/item_detail_by_url",
+    "pdd": "pdd/item_detail",
+    "jd": "jd/item_detail",
+}
+
+
 async def _fetch_tmapi(item_id: str, marketplace: str) -> dict[str, Any] | None:
     if not TMAPI_TOKEN:
         return None
-    mp_path = {
-        "taobao": "taobao/item_detail",
-        "tmall": "taobao/item_detail",
-        "1688": "1688/item_detail",
-        "pdd": "pdd/item_detail",
-        "jd": "jd/item_detail",
-    }.get(marketplace)
+    mp_path = _TMAPI_DETAIL_PATH.get(marketplace)
     if not mp_path:
         return None
-    url = f"http://api.tmapi.top/{mp_path}"
+    url = f"https://api.tmapi.top/{mp_path}"
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
         r = await client.get(url, params={"apiToken": TMAPI_TOKEN, "item_id": item_id})
         r.raise_for_status()
@@ -359,43 +369,58 @@ async def _fetch_tmapi(item_id: str, marketplace: str) -> dict[str, Any] | None:
 
 
 async def _search_tmapi(query: str, marketplace: str, max_results: int) -> list[Offer]:
+    """Chinese search via TMAPI. REALITY (per tmapi.top docs): only 1688
+    (alibaba) has a keyword-search endpoint; taobao/tmall/jd/pdd are
+    detail-only. Those lanes surface an honest skip note instead of
+    pretending to search. 4013 = API not subscribed in the console
+    (https://console.tmapi.io → APIs List → Subscribe) — surfaced verbatim.
+    """
     if not TMAPI_TOKEN:
         return []
-    mp_search = {
-        "taobao": "taobao/item_search",
-        "tmall": "taobao/item_search",
-        "1688": "1688/item_search",
-        "pdd": "pdd/item_search",
-        "jd": "jd/item_search",
-    }.get(marketplace)
-    if not mp_search:
-        return []
-    url = f"http://api.tmapi.top/{mp_search}"
+    if marketplace not in ("1688", "alibaba"):
+        return [
+            Offer(
+                offer_id=f"{marketplace}:unsupported",
+                marketplace=marketplace,
+                title=f"[{marketplace}] keyword search not available on TMAPI (detail-only API) — use get_offer_detail with an item id",
+                source_reliability="aggregator",
+                raw={"reason": "TMAPI has no keyword-search endpoint for this marketplace; only 1688/alibaba does"},
+            )
+        ]
+    url = "https://api.tmapi.top/alibaba/search/items"
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
-            r = await client.get(url, params={"apiToken": TMAPI_TOKEN, "q": query, "page": 1, "page_size": max_results})
+            r = await client.get(url, params={"apiToken": TMAPI_TOKEN, "keywords": query, "page": 1, "sort": "relevance"})
+            if r.status_code == 401:
+                return [Offer(offer_id="1688:unsubscribed", marketplace="1688", title="[1688] TMAPI error 4013: API not subscribed — subscribe at console.tmapi.io → APIs List", source_reliability="aggregator", raw={"error": r.text[:200]})]
             r.raise_for_status()
             data = r.json()
-            items = data.get("data", {}).get("items") or data.get("result") or []
+            items = (data.get("data") or {}).get("products") or (data.get("data") or {}).get("items") or []
             offers: list[Offer] = []
             for it in items[:max_results]:
+                # alibaba search item shape (from docs): product title/subject,
+                # price ranges, trade info, supplier company
                 price_cny = None
-                try:
-                    price_cny = float(str(it.get("price") or it.get("price_cny") or "0").replace("¥", "").strip() or 0) or None
-                except Exception:
-                    price_cny = None
+                for k in ("price", "min_price", "price_range_min"):
+                    v = it.get(k)
+                    if v is not None:
+                        try:
+                            price_cny = round(float(str(v).replace("¥", "").strip() or 0), 2) or None
+                            if price_cny:
+                                break
+                        except ValueError:
+                            continue
                 offers.append(
                     Offer(
-                        offer_id=f"{marketplace}:{it.get('item_id') or it.get('product_id') or it.get('num_iid') or 'unknown'}",
-                        marketplace=marketplace,
-                        title=str(it.get("title") or it.get("subject") or query),
-                        url=it.get("url") or it.get("detail_url"),
-                        image=it.get("pic") or it.get("image"),
+                        offer_id=f"1688:{it.get('product_id') or it.get('id') or 'unknown'}",
+                        marketplace="1688",
+                        title=str(it.get("title") or it.get("subject") or it.get("product_name") or query),
+                        url=it.get("detail_url") or it.get("product_url") or it.get("url"),
+                        image=it.get("image") or it.get("pic") or (it.get("images") or [None])[0],
                         price_cny=price_cny,
                         price_aud=_cny_to_aud(price_cny),
-                        moq=it.get("moq"),
-                        stock=it.get("stock"),
-                        seller=Seller(shop_name=it.get("shop_name") or it.get("seller")),
+                        moq=it.get("min_order") or it.get("moq"),
+                        seller=Seller(shop_name=it.get("company_name") or it.get("supplier_name")),
                         source_reliability="aggregator",
                         raw=it if os.getenv("PROCUREMENT_INCLUDE_RAW") == "1" else None,
                     )
@@ -412,9 +437,6 @@ async def _search_tmapi(query: str, marketplace: str, max_results: int) -> list[
                 raw={"error": str(e)},
             )
         ]
-
-
-_EBAY_TOKEN_CACHE: tuple[str, float] | None = None  # (token, expiry_epoch)
 
 
 async def _get_ebay_token() -> str | None:
