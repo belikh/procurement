@@ -1330,7 +1330,7 @@ async def search_offers(
     if tasks:
         # Heavy hosted-actor lanes scrape full search pages (30-90s); the
         # fast lanes (RSS, eBay official API) ride the normal timeout.
-        HEAVY_LANES = {"amazon_au", "taobao", "tmall", "jd", "1688"}
+        HEAVY_LANES = {"amazon_au", "taobao", "tmall", "jd", "1688", "ebay_sold"}
         for mp, task in tasks.items():
             lane_timeout = 95 if mp in HEAVY_LANES else DEFAULT_TIMEOUT_S + 2
             try:
