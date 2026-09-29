@@ -960,8 +960,18 @@ async def _search_apify_chinese(actor: str, marketplace: str, query: str, max_re
             if r.status_code not in (200, 201):
                 return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] actor error {r.status_code}", source_reliability="best_effort", raw={"error": r.text[:300]})]
             items = r.json() if isinstance(r.json(), list) else r.json().get("items", [])
+            # Actor-level error envelope (e.g. {"error": "free_tier_exhausted",
+            # "message": "Free plan allows 10 runs...", "upgradeUrl": ...}) —
+            # a quota/billing notice, NOT a product. Presenting it as an offer
+            # (id "unknown", query echoed as title) would be synthetic garbage,
+            # so convert it to an honest diagnostic instead.
+            if items and all(isinstance(it, dict) and "error" in it and not (it.get("itemId") or it.get("skuId")) for it in items):
+                msg = str(items[0].get("message") or items[0].get("error"))[:200]
+                return [Offer(offer_id=f"{marketplace}:error", marketplace=marketplace, title=f"[{marketplace}] actor error: {msg}", source_reliability="best_effort", raw={"error": msg})]
             offers: list[Offer] = []
             for it in items[:max_results]:
+                if isinstance(it, dict) and "error" in it and not (it.get("itemId") or it.get("skuId")):
+                    continue  # mixed error envelope among real items — skip it
                 raw_price = it.get("price")
                 if isinstance(raw_price, dict):
                     # 1688 wholesale shape: {min, max, currency}
