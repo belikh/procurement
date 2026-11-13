@@ -1,109 +1,149 @@
-# Procurement MCP — federated search across Chinese + Australian marketplaces
+<p align="right">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/belikh/design/main/packages/graphics/logo/jupiter-logo-dark.svg">
+    <img alt="jupiter.au" src="https://raw.githubusercontent.com/belikh/design/main/packages/graphics/logo/jupiter-logo-light.svg" width="260">
+  </picture>
+</p>
 
-> Integration-only. Every source is a hosted API you call with a key — **no scrapers are built here**. Chinese sources via aggregators (TMAPI), Australian sources via official APIs where they exist (eBay AU) and hosted scraper-APIs where they don't (Gumtree, Facebook Marketplace).
+# Procurement MCP
 
-Natural-language procurement: *find me the cheapest / fastest shipped / best value `<item>`* → normalised `Offer[]` ranked by landed cost, ETA and seller trust.
+An MCP server that searches Chinese and Australian marketplaces in one call. Ask for the cheapest, fastest or best-value item and it returns normalised offers ranked by landed cost, delivery time and seller trust.
 
-Identity for sign-ups: **`io+agent@jupiter.au`** (approved).
+Every source is a hosted API that you call with a key. The server contains no scrapers. Chinese sources go through aggregators (TMAPI), Australian sources go through official APIs where they exist (eBay AU), and Gumtree and Facebook Marketplace go through hosted scraper APIs.
 
-## Quick start
+<p>
+  <a href="#install">Install</a> ·
+  <a href="#tools">Tools</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#ranking">Ranking</a> ·
+  <a href="#database">Database</a> ·
+  <a href="#develop">Develop</a>
+</p>
 
-```bash
+<br>
+
+---
+
+<br>
+
+## Install
+
+```sh
 uv sync
-cp .env.example .env   # add keys
-uv run mcp dev server.py          # Inspector at http://localhost:5173
-uv run python server.py           # stdio — for Claude Desktop
+cp .env.example .env              # add keys
+uv run mcp dev server.py          # MCP Inspector at http://localhost:5173
+uv run python server.py           # stdio, for Claude Desktop
 uv run mcp install server.py      # install into Claude Desktop
 ```
 
-Mock fallback means the server is **demo-able with zero keys** — `search_offers` returns synthetic offers and `health` reports `mock_fallback: true`.
+With no keys set, `search_offers` returns synthetic offers and `health` reports `mock_fallback: true`, so the server can be tried without signing up for anything.
+
+<br>
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `search_offers(query, marketplaces?, sort=best_value, qty=1, ship_to=AU, max_results=10)` | Federated parallel search. `marketplaces` subset of `taobao`, `tmall`, `1688`, `jd`, `pdd`, `aliexpress`, `ebay_au`, `ebay_sold` (real AU sold prices), `amazon_au`, `gumtree`, `facebook`, `woolworths`, `coles`, `aldi`, `ozbargain`, `cheapies`, `ozbargain_search`. Sort `cheapest` = landed cost (unit price for grocery), `fastest` = ETA, `best_value` = 0.5 price + 0.25 speed + 0.25 trust (community votes outrank seller ratings). MOQ-aware for 1688 wholesale. |
-| `search_by_image(image_url, destination, max_results)` | Reverse image search — photo to matching 1688/Alibaba/AliExpress/global supplier listings with price, MOQ, supplier. |
-| `get_offer_detail(offer_id)` | Detail for `marketplace:item_id` (TMAPI) or `ebay_au:itemId` (Browse `getItem`). |
-| `health()` | Which integrations are configured (no secrets). |
+| `search_offers(query, marketplaces?, sort=best_value, qty=1, ship_to=AU, max_results=10)` | Parallel search across marketplaces. Returns offers ranked by the chosen sort. |
+| `search_by_image(image_url, destination, max_results)` | Reverse image search. Takes a photo and returns matching supplier listings from 1688, Alibaba, AliExpress and global retail sites, with price, MOQ and supplier. Costs $0.10 per search. |
+| `get_offer_detail(offer_id)` | Detail for `marketplace:item_id` (TMAPI) or `ebay_au:itemId` (eBay Browse `getItem`). |
+| `health()` | Which integrations are configured. Shows no secrets. |
 | Prompt `procurement_brief` | System prompt for procurement reasoning. |
 
-All tools run concurrent `asyncio` fan-out with per-marketplace timeout (`PROCUREMENT_TIMEOUT_S`, default 8s) and never fail the whole search if one marketplace errors.
+`marketplaces` takes any subset of: `taobao`, `tmall`, `1688`, `jd`, `pdd`, `aliexpress`, `ebay_au`, `ebay_sold`, `amazon_au`, `gumtree`, `facebook`, `woolworths`, `coles`, `aldi`, `ozbargain`, `cheapies`, `ozbargain_search`.
 
-## Deal-signal lanes (no marketplace required)
+Searches run concurrently with a per-marketplace timeout (`PROCUREMENT_TIMEOUT_S`, default 8 seconds). If one marketplace fails, the others still return.
 
-Beyond marketplaces, the federation carries **deal-vetting signals**:
+<details>
+<summary><b>Deal-signal sources</b></summary>
 
-* **`ozbargain` / `cheapies`** — the sites' own official RSS feeds (`/deals/feed`), parsed with stdlib `xml.etree` — no key, no ToS risk. Each offer carries `community` (votes ±, comments, clicks, expiry, brand, tags) parsed from the `ozb:meta` extension and `<category>` taxonomy, plus price-from-title and the affiliate `goto` link. The `best_value` trust term uses net community votes — a +5-voted deal outranks a heuristic 4.8-star seller.
-* **`ozbargain_search`** — true keyword search over OzBargain via the hosted Apify actor `parseforge/ozbargain-australia-scraper` (reuses `APIFY_TOKEN`; costs Apify credits).
-* **`ebay_sold`** — real eBay AU **sold** prices (what items actually sold for, not asking) via `caffein.dev/ebay-sold-listings` with `ebaySite: ebay.com.au`. Sold comps land in `price_history` — a ranking correction no official API offers.
-* **`keepa` price history** — when `KEEPA_API_KEY` is set, `amazon_au` offers get a `price_history` block (90-day avg/min via Keepa's official API, domain 12 = amazon.com.au).
+- **`ozbargain` and `cheapies`** read the sites' official RSS feeds (`/deals/feed`) with the standard library `xml.etree`. They need no key. Each offer carries community data (votes, comments, clicks, expiry, brand, tags) taken from the `ozb:meta` extension and the `<category>` taxonomy, the price parsed from the title, and the affiliate `goto` link. The `best_value` trust term uses net community votes, so a deal with +5 votes outranks a seller with a 4.8 rating.
+- **`ozbargain_search`** does keyword search over OzBargain through the Apify actor `parseforge/ozbargain-australia-scraper`. It reuses `APIFY_TOKEN` and costs Apify credits.
+- **`ebay_sold`** returns eBay AU sold prices, meaning what items sold for rather than asking prices, through `caffein.dev/ebay-sold-listings` with `ebaySite: ebay.com.au`. Sold prices go into `price_history`.
+- **Keepa price history.** When `KEEPA_API_KEY` is set, `amazon_au` offers get a `price_history` block with the 90-day average and minimum from Keepa's official API (domain 12, amazon.com.au).
 
-## Grocery lanes — unit economics
+</details>
 
-`woolworths`, `coles`, `aldi` via the dromb Apify series ($0.30/1k):
-`operation: search` with unit pricing, specials and barcodes. Grocery offers carry `unit_price_aud` + `unit` + `regular_price_aud` — `price_aud` holds the **effective** price (special when present). The `cheapest` ranker sorts on **unit price** when available, because a $4.50 2L milk beats a $3.10 1L and item price cannot express that. Costco deliberately excluded — every store actor targets costco.com (US/USD); revisit if an AU actor appears.
+<details>
+<summary><b>Grocery sources</b></summary>
 
-`search_offers` gates grocery and Amazon results with a relevance filter (every query term must appear in title/brand/category) — ALDI's catalogue search fuzzes "milk" into oil and lollipops without it.
+`woolworths`, `coles` and `aldi` use the dromb Apify actors ($0.30 per 1,000 results) with `operation: search`, which returns unit prices, specials and barcodes. Grocery offers carry `unit_price_aud`, `unit` and `regular_price_aud`. `price_aud` holds the effective price, which is the special price when there is one.
 
-## `search_by_image(image_url, destination, max_results)`
+The `cheapest` sort uses unit price when it exists. A $4.50 2L bottle of milk beats a $3.10 1L bottle, and item price cannot show that.
 
-Sourcing by photo — reverse image search across `1688` (wholesale factories), `alibaba` (B2B), `aliexpress` (retail), `global` (Amazon/Walmart/eBay and thousands of retail sites). Hand it a photo from any listing and get matching supplier listings with price, MOQ, supplier name and location. Alibaba's own visual-search tech, $0.10/search.
+Grocery and Amazon results pass a relevance filter: every query term must appear in the title, brand or category. Without it, ALDI's catalogue search matches "milk" to oil and lollipops.
 
-## API keys — where to sign up as `io+agent@jupiter.au`
+Costco is left out. Every Costco actor targets costco.com (US, USD). It can be added if an Australian actor appears.
 
-### Recommended primary (full Chinese width in one key)
+</details>
 
-* **TMAPI** — https://console.tmapi.io/user/signup → Account Center → `apiToken`. Covers taobao/tmall/1688/pdd/jd with `item_search` + `item_detail`. Free 200/mo, paid from ~$8/mo. Set `TMAPI_TOKEN`.
-* **AliExpress Affiliate** (official, moderate barrier) — https://openservice.aliexpress.com → UAC account with `io+agent@jupiter.au` → join Affiliate Program → create app (1–2 day approval) → `AppKey`/`AppSecret` → set `ALIEXPRESS_APP_KEY`/`ALIEXPRESS_APP_SECRET`.
+<br>
 
-### Australian
+## Configuration
 
-* **eBay AU** — https://developer.ebay.com → Create app with `io+agent@jupiter.au` → obtain `AppID` (`Client ID`) + `CertID` (`Client Secret`) → set `EBAY_APP_ID`/`EBAY_CERT_ID`. Server does client-credentials flow for `https://api.ebay.com/identity/v1/oauth/token` scope `https://api.ebay.com/oauth/api_scope` and calls `buy/browse/v1/item_summary/search` with `X-EBAY-C-MARKETPLACE-ID: EBAY_AU`.
-* **Amazon AU** — Seller Central Professional + https://developer.amazonservices.com → SP-API Far East endpoint `https://sellingpartnerapi-fe.amazon.com` (for catalogue/pricing if you are a seller) or Product Advertising API `PA-API 5.0` via `AMAZON_PAAPI_*` + `PARTNER_TAG=jupiter-22`.
+Copy `.env.example` to `.env` and fill in the keys you have. The sign-up identity for the keys below is `io+agent@jupiter.au`.
 
-### Hosted scraper-APIs (you call, they run browsers)
+| Source | Where to get it | Variables |
+|---|---|---|
+| TMAPI (Taobao, Tmall, 1688, PDD, JD; recommended first key) | [console.tmapi.io](https://console.tmapi.io/user/signup), then Account Center, `apiToken`. Free tier of 200 requests per month; paid from about $8 per month. | `TMAPI_TOKEN` |
+| AliExpress Affiliate (official) | [openservice.aliexpress.com](https://openservice.aliexpress.com). Create a UAC account, join the Affiliate Program and create an app. Approval takes 1 to 2 days. | `ALIEXPRESS_APP_KEY`, `ALIEXPRESS_APP_SECRET` |
+| eBay AU | [developer.ebay.com](https://developer.ebay.com). Create an app and take the App ID and Cert ID. The server uses the client-credentials flow and calls `buy/browse/v1/item_summary/search` with `X-EBAY-C-MARKETPLACE-ID: EBAY_AU`. | `EBAY_APP_ID`, `EBAY_CERT_ID` |
+| Amazon AU | Seller Central Professional with the [SP-API](https://developer.amazonservices.com) Far East endpoint, or the Product Advertising API 5.0. | `AMAZON_PAAPI_*`, `PARTNER_TAG=jupiter-22` |
+| Facebook Marketplace | [sociavault.com](https://sociavault.com). Supports AU latitude and longitude. Pay per request. | `SOCIAVAULT_API_KEY` |
+| Gumtree AU and other Apify actors | [console.apify.com](https://console.apify.com/settings/integrations), actor `crawlerbros/gumtree-scraper`. Apify handles the residential proxy and Akamai bypass. | `APIFY_TOKEN` |
+| JD fallback (optional) | [elim.asia](https://elim.asia) and RapidAPI | `ELIM_API_TOKEN`, `RAPIDAPI_KEY` |
 
-* **SociaVault** — https://sociavault.com → Facebook Marketplace `search` + `item` (`SOCIAVAULT_API_KEY`). Supports AU lat/lng. Pay-per-request, real-time.
-* **Apify** — https://console.apify.com/settings/integrations → `APIFY_TOKEN` → actor `crawlerbros/gumtree-scraper` for Gumtree AU (residential + Akamai bypass handled by Apify).
+<br>
 
-Optional: `ELIM_API_TOKEN` (https://elim.asia) and `RAPIDAPI_KEY` for Otcommerce JD fallback.
+## Ranking
 
-## Behaviour and ranking
+- **Price.** `price_cny` is converted to `price_aud` with `CNY_TO_AUD` (default 0.215). Landed cost is `price_aud * qty + shipping.intl_estimate_aud`.
+- **MOQ.** For 1688, offers with `qty < moq` go to the end of the list and are flagged.
+- **Delivery.** `shipping.eta_days` is a `[min, max]` range.
+- **Trust.** Taken from `seller.rating` and `source_reliability` (`authoritative`, then `aggregator`, then `best_effort`).
+- **Sorts.** `cheapest` sorts by landed cost (unit price for grocery). `fastest` sorts by delivery time. `best_value` is `0.5 price + 0.25 speed + 0.25 trust`.
 
-* **Price normalisation** — `price_cny` → `price_aud` via `CNY_TO_AUD` (default 0.215). Landed cost = `price_aud * qty + shipping.intl_estimate_aud`. `qty < moq` (1688) pushes to end and is flagged.
-* **ETA** — `shipping.eta_days` `[min, max]`.
-* **Trust** — `seller.rating` / `source_reliability` (`authoritative` > `aggregator` > `best_effort`).
-* **Sorts** — `cheapest` by landed cost, `fastest` by ETA, `best_value` composite `0.5 price + 0.25 speed + 0.25 trust`.
+<br>
 
-## Project layout
+## Database
 
-```
-pyproject.toml
-server.py          # FastMCP server + all integrations
-.env.example
-research/          # hyperresearch vault (light run procurement-mcp-51d4f3)
-```
+When `DATABASE_URL` is set, the server caches federated results and logs searches in the fleet Postgres (`10.1.1.3:5432`, database `jupiter`, schema `procurement`). Without it, the server keeps no state.
 
-## Database — Postgres on 10.1.1.3
-
-When `DATABASE_URL` is set, the server caches federated results and logs searches in the fleet Postgres (`10.1.1.3:5432`, `jupiter` db, schema `procurement` per stack law). When unset it runs stateless.
-
-```bash
-# Example — set in .env
+```sh
+# in .env
 DATABASE_URL=postgresql://procurement:__SET_ME__@10.1.1.3:5432/jupiter
 PROCUREMENT_PG_SCHEMA=procurement
-# Apply once
+
+# apply once
 psql "$DATABASE_URL" -f migrations/001_procurement_cache.sql
 ```
 
-`health()` reports `database.enabled` / `database.error` without leaking secrets. Cache TTL is `PROCUREMENT_CACHE_TTL_S` (default 3600s). Tables: `procurement.search_cache` (keyed by query+marketplaces+sort+qty+ship_to) and `procurement.search_log`.
+The tables are `procurement.search_cache` (keyed by query, marketplaces, sort, qty and ship_to) and `procurement.search_log`. The cache lifetime is `PROCUREMENT_CACHE_TTL_S` (default 3600 seconds). `health()` reports `database.enabled` and `database.error` without exposing secrets.
 
-## Development
+<br>
 
-```bash
-# Use the hyperresearch venv that already has deps, or create your own
-/home/io/projects/hyperresearch-opencode/.venv/bin/python -m py_compile server.py
-/home/io/projects/hyperresearch-opencode/.venv/bin/ruff check server.py
-/home/io/projects/hyperresearch-opencode/.venv/bin/python -c "from server import health; print(health())"
+## Develop
+
+```sh
+uv sync --extra dev
+uv run ruff check server.py
+uv run python -m py_compile server.py
+uv run python -c "from server import health; print(health())"
 ```
+
+```text
+server.py          FastMCP server and all integrations
+migrations/        Postgres schema for the cache and search log
+.env.example       environment variable template
+pyproject.toml
+```
+
+<br>
+
+## Licence
+
+`pyproject.toml` declares MIT.
+
+<br>
+
+<p align="right"><sub>jupiter.au</sub></p>
