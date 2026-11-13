@@ -2,7 +2,7 @@
 name = "procurement-mcp"
 version = "0.1.0"
 description = "Federated procurement MCP server — Chinese marketplaces + Australian sources via integration-only APIs"
-readme = "README.md"
+readme = "README.rst"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "procurement", email = "io+agent@jupiter.au" }]
