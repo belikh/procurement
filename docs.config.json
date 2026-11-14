@@ -3,6 +3,13 @@
   "id": "procurement",
   "description": "An MCP server that searches Australian and Chinese marketplaces in one call and ranks offers by landed cost to a destination postcode, delivery time and seller trust.",
   "icon": "cart",
+  "sections": [
+    { "id": "start", "title": "Start", "summary": "Install the server and run your first search." },
+    { "id": "guides", "title": "Guides", "summary": "Common tasks, as numbered steps." },
+    { "id": "reference", "title": "Reference", "summary": "Every command, option and marketplace lane." },
+    { "id": "concepts", "title": "Concepts", "summary": "How the server works and why." },
+    { "id": "develop", "title": "Develop", "summary": "Build, test and release the server." }
+  ],
   "version": "0.1.0",
   "repo": "https://github.com/belikh/procurement",
   "author": "belikh",
