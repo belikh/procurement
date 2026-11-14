@@ -6,3 +6,5 @@ __pycache__/
 .opencode/
 research/
 .venv/
+dist/
+node_modules/

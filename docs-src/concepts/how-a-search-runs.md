@@ -1,0 +1,44 @@
+---
+title: How a search runs
+summary: The steps from a search_offers call to the ranked list, with the lane registry, the deadline and the cache.
+order: 10
+icon: topology
+audience: developers
+status: draft
+---
+
+The server contains no scrapers. Each [[term:Marketplace]] has a [[term:Lane]] that calls one hosted API: the eBay Browse API, TMAPI, SociaVault, an Apify actor or an RSS feed. A search runs every requested lane at once and merges what comes back.
+
+## Steps
+
+1. **Resolve names.** The server lower-cases the requested names and drops repeats. A name that is not in the registry gets an `unsupported` diagnostic.
+2. **Read the cache.** With a database, the server looks for an unexpired result with the same cache key and returns it.
+3. **Check keys.** A lane whose key is unset is not started. It returns a `missing_key` diagnostic that names the variable.
+4. **Run lanes.** The remaining lanes start together. Lanes in one group share one upstream run: `taobao` and `tmall` use one Taobao actor run.
+5. **Apply the deadline.** Each lane may run for its own budget or until the search deadline, whichever is shorter. A lane that is still running is cancelled and returns a `timeout` diagnostic.
+6. **Annotate.** The server sets a delivery status and a landed cost on every offer.
+7. **Rank.** The server ranks the offers by `sort` and keeps the first `max_results * 2`.
+8. **Assemble.** The result is the ranked offers, then the comps, then the diagnostics.
+9. **Store.** The server caches the result and logs the search, when a database is configured.
+
+## One outcome per lane
+
+Every requested marketplace returns offers or exactly one [[term:Diagnostic]]. A caller can tell an empty marketplace from a broken one, because the diagnostic's code says which it is: `no_results`, `timeout`, `missing_key` and so on.
+
+Any exception inside a lane becomes an `upstream_error` diagnostic. `search_offers` itself does not fail when a source fails.
+
+## Retries
+
+Direct API calls (eBay, TMAPI, feeds) retry up to 2 times on a connection error or on HTTP 429, 502, 503 and 504, with a wait of 0.5 then 1 second. An Apify actor call is sent once, because each call starts a paid actor run.
+
+## Cache
+
+A failed search is not cached. If any diagnostic has the code `timeout`, `upstream_error` or `quota`, the result is returned and left out of the cache. The next call then tries the source again.
+
+Cached results live for `PROCUREMENT_CACHE_TTL_S` seconds, 3600 by default. The server also remembers the last 2000 offers in memory, so that `get_offer_detail` can answer for marketplaces with no detail endpoint.
+
+:::see-also
+- [[concepts/landed-cost]]
+- [[concepts/ranking]]
+- [[develop/add-a-marketplace]]
+:::

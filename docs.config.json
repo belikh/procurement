@@ -1,0 +1,19 @@
+{
+  "project": "Procurement MCP",
+  "id": "procurement",
+  "description": "An MCP server that searches Australian and Chinese marketplaces in one call and ranks offers by landed cost to a destination postcode, delivery time and seller trust.",
+  "icon": "cart",
+  "version": "0.1.0",
+  "repo": "https://github.com/belikh/procurement",
+  "author": "belikh",
+  "glossary": {
+    "Marketplace": "A name you pass to search_offers, such as ebay_au or 1688. The server knows 16.",
+    "Lane": "The code that searches one marketplace through one hosted API. Each lane returns offers or one diagnostic.",
+    "Offer": "One listing you can buy, with a price, a delivery status and a landed cost.",
+    "Comp": "A past sale price from ebay_sold. A comp shows what an item sold for and cannot be bought.",
+    "Diagnostic": "The entry a marketplace returns when it has no offers. Its diagnostic_code gives the reason.",
+    "Landed cost": "The total in AUD for the requested quantity delivered to the destination postcode.",
+    "Forwarder": "A freight company that receives goods at a warehouse in China and ships them to Australia.",
+    "Destination": "The country and postcode that offers must reach. The default is AU 4000, Brisbane."
+  }
+}

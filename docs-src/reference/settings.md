@@ -1,0 +1,100 @@
+---
+title: Settings
+summary: Every environment variable the server reads, with its default.
+order: 40
+icon: settings
+audience: users
+status: draft
+---
+
+The server reads settings from the environment and from `.env` in the repository root. The environment wins over `.env`. Every setting is optional, and an empty value counts as unset. `.env.example` lists them all.
+
+## Destination
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SHIP_TO_COUNTRY` | `AU` | Destination country code. |
+| `SHIP_TO_POSTCODE` | `4000` | Destination postcode (Brisbane). |
+| `SHIP_TO_LAT` | `-27.4698` | Latitude of the centre for pickup searches. |
+| `SHIP_TO_LNG` | `153.0251` | Longitude of the centre for pickup searches. |
+| `PICKUP_RADIUS_KM` | `50` | Radius for pickup searches. |
+
+## Keys
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `APIFY_TOKEN` | unset | Apify token for every Apify actor lane and `search_by_image`. |
+| `TMAPI_TOKEN` | unset | TMAPI key. `TMAPI_API_TOKEN` is accepted too. |
+| `EBAY_APP_ID` | unset | eBay client id. `EBAY_CLIENT_ID` is accepted too. |
+| `EBAY_CERT_ID` | unset | eBay client secret. `EBAY_CLIENT_SECRET` is accepted too. |
+| `EBAY_OAUTH_TOKEN` | unset | A bearer token fetched by you. Skips the client-credentials call. |
+| `SOCIAVAULT_API_KEY` | unset | SociaVault key for `facebook`. |
+| `KEEPA_API_KEY` | unset | Keepa key for `get_price_history`. |
+| `KEEPA_DOMAIN` | unset | Keepa's numeric domain id for amazon.com.au. |
+| `GUMTREE_COOKIES` | unset | Cookies from a browser session on Gumtree. |
+
+## Apify actors
+
+Each lane runs the actor named here. Change a value to run another actor with the same output format.
+
+| Variable | Default |
+| --- | --- |
+| `TAOBAO_APIFY_ACTOR` | `zen-studio/taobao-search-scraper` |
+| `JD_APIFY_ACTOR` | `zen-studio/jd-com-search-scraper` |
+| `ALI1688_APIFY_ACTOR` | `zen-studio/1688-wholesale-scraper` |
+| `AMAZON_APIFY_ACTOR` | `junglee/free-amazon-product-scraper` |
+| `EBAY_SOLD_APIFY_ACTOR` | `caffein.dev/ebay-sold-listings` |
+| `WOOLWORTHS_APIFY_ACTOR` | `dromb/woolworths-au-product-search-catalog-unofficial` |
+| `COLES_APIFY_ACTOR` | `dromb/coles-au-product-search-specials-stores-unofficial` |
+| `ALDI_APIFY_ACTOR` | `dromb/aldi-au-product-search-catalog-unofficial` |
+| `GUMTREE_APIFY_ACTOR` | `crawlerbros/gumtree-scraper` |
+| `IMAGE_SEARCH_APIFY_ACTOR` | `dev00/alibaba-1688-aliexpress-reverse-image-search-api` |
+
+## Deal feeds
+
+| Variable | Default |
+| --- | --- |
+| `OZBARGAIN_FEED_URL` | `https://www.ozbargain.com.au/deals/feed` |
+| `CHEAPIES_FEED_URL` | `https://www.cheapies.nz/deals/feed` |
+
+## Forwarder estimate and currency
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `FORWARDER_RATE_AUD_PER_KG` | `12.0` | Freight per kg, China to Australia. A placeholder. |
+| `FORWARDER_DEFAULT_WEIGHT_KG` | `0.5` | Weight of one item when a search gives none. A placeholder. |
+| `FORWARDER_MIN_CHARGE_AUD` | `15.0` | Smallest freight charge. A placeholder. |
+| `FORWARDER_FEE_PCT` | `0.0` | Forwarder service fee as a fraction. |
+| `GST_RATE` | `0.10` | GST applied to the forwarded total. |
+| `CNY_TO_AUD` | `0.215` | Fixed CNY to AUD rate. |
+| `NZD_TO_AUD` | `0.92` | Fixed NZD to AUD rate, for Cheapies prices. |
+
+## Database
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DATABASE_URL` | unset | Postgres connection string. Unset: no cache, no log. |
+| `PROCUREMENT_PG_SCHEMA` | `procurement` | Schema name. Must match `[a-z_][a-z0-9_]*`. |
+| `PROCUREMENT_CACHE_TTL_S` | `3600` | Seconds a cached search is served. |
+
+## Behaviour
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PROCUREMENT_DEADLINE_S` | `55` | Seconds allowed for a whole search. |
+| `PROCUREMENT_TIMEOUT_S` | `8` | Timeout of one direct API call (eBay, TMAPI, feeds). |
+| `PROCUREMENT_INCLUDE_RAW` | `0` | `1` adds each source's raw payload to offers as `raw`. |
+| `MCP_HTTP_PORT` | unset | Serve streamable HTTP on `127.0.0.1:<port>` at `/mcp`. Unset: stdio. |
+
+## eBay notifications
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `EBAY_DELETION_TOKEN` | unset | Verification token for eBay account-deletion notifications. |
+| `EBAY_DELETION_ENDPOINT` | `https://procurement.jupiter.au/ebay/notifications` | The URL registered in the eBay developer portal. |
+
+:::see-also
+- [[guides/add-keys]]
+- [[guides/set-forwarder-rates]]
+- [[guides/keep-search-history]]
+:::
