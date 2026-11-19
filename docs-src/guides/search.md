@@ -50,12 +50,14 @@ status: draft
 ```json title="Chinese marketplaces"
 {
   "query": "silicone kitchen utensils",
-  "query_zh": "硅胶厨具",
+  "query_zh": "\u7845\u80f6\u53a8\u5177",
   "marketplaces": ["1688", "taobao", "jd"],
   "qty": 50,
   "est_weight_kg": 0.3
 }
 ```
+
+The `\u` escapes spell silicone kitchenware in Chinese characters. JSON reads an escape as the character itself, so the server gets the same text whether you type the escapes or the characters.
 
 An offer whose `moq` is larger than `qty` goes to the end of the list in every sort.
 
